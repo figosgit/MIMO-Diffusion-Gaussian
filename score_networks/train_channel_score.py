@@ -12,6 +12,13 @@ Usage:
 import argparse
 import os
 import math
+import csv
+import json
+import time
+import traceback
+import logging
+from datetime import datetime
+
 import yaml
 import torch
 import torch.nn as nn
@@ -21,6 +28,33 @@ from tqdm import tqdm
 
 from .ncsnpp import ChannelScoreNet, ChannelScoreNet2ndOrder, get_sigmas
 from channels.rayleigh import generate_rayleigh_channel, noise_schedule_exponential
+
+
+def setup_logging(log_dir: str, run_name: str):
+    """Set up file logging + CSV metrics logger. Returns (logger, csv_path)."""
+    os.makedirs(log_dir, exist_ok=True)
+
+    log_path = os.path.join(log_dir, f"{run_name}.log")
+    csv_path = os.path.join(log_dir, f"{run_name}_metrics.csv")
+
+    logger = logging.getLogger(run_name)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()  # avoid duplicate handlers if called twice
+
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(fh)
+
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(ch)
+
+    # Init CSV with header
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "avg_loss", "lr", "epoch_time_sec", "best_loss_so_far", "timestamp"])
+
+    return logger, csv_path, log_path
 
 
 def dsm_loss(net, H0, sigmas, device):
@@ -57,8 +91,19 @@ def dsm_loss(net, H0, sigmas, device):
     return loss
 
 
-def train(cfg: dict):
+def train(cfg: dict, config_path: str = ""):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- Logging setup ---
+    log_dir = cfg.get("log_dir", "logs")
+    run_name = cfg.get("run_name") or os.path.splitext(os.path.basename(config_path))[0] or "run"
+    run_name = f"{run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    logger, csv_path, log_path = setup_logging(log_dir, run_name)
+
+    logger.info(f"Starting run: {run_name}")
+    logger.info(f"Device: {device}")
+    logger.info(f"Config: {json.dumps(cfg, indent=2, default=str)}")
+
     Nr = cfg.get("Nr", 4)
     Nt = cfg.get("Nt", 1)
     K = cfg.get("K", 192)
@@ -71,8 +116,6 @@ def train(cfg: dict):
 
     net = ChannelScoreNet(Nr=Nr, Nt=Nt, K=K).to(device)
     optimizer = optim.Adam(net.parameters(), lr=cfg.get("score_lr", 2e-4))
-    # Cosine annealing decays LR smoothly to eta_min, avoiding the abrupt drops
-    # from StepLR that cause loss to spike when sigma^2-weighted gradients are large.
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=cfg.get("score_epochs", 200),
@@ -85,32 +128,104 @@ def train(cfg: dict):
     batch_size = cfg.get("score_batch_size", 256)
 
     best_loss = float("inf")
-    for epoch in range(epochs):
-        net.train()
-        # Generate fresh channel samples each epoch
-        H0 = generate_rayleigh_channel(batch_size * 10, Nu, Nr, Nt, K, device)
-        H0 = H0[:, 0]  # (B, NrK, NtK)
-        ds = TensorDataset(H0)
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
+    history = []  # in-memory record, also dumped to JSON at the end
+    run_start = time.time()
 
-        total = 0.0
-        for (h,) in loader:
-            loss = dsm_loss(net, h, sigmas, device)
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-            optimizer.step()
-            total += loss.item()
-        scheduler.step()
-        avg = total / len(loader)
-        if (epoch + 1) % 20 == 0:
-            print(f"Epoch {epoch+1}/{epochs} | loss={avg:.6f}")
-        if avg < best_loss:
-            best_loss = avg
-            torch.save(net.state_dict(), os.path.join(ckpt_dir, "channel_score_best.pt"))
+    try:
+        for epoch in range(epochs):
+            epoch_start = time.time()
+            net.train()
+            # Generate fresh channel samples each epoch
+            H0 = generate_rayleigh_channel(batch_size * 10, Nu, Nr, Nt, K, device)
+            H0 = H0[:, 0]  # (B, NrK, NtK)
+            ds = TensorDataset(H0)
+            loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
 
-    torch.save(net.state_dict(), os.path.join(ckpt_dir, "channel_score_final.pt"))
-    print("Channel score network training complete.")
+            total = 0.0
+            for (h,) in loader:
+                loss = dsm_loss(net, h, sigmas, device)
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+                optimizer.step()
+                total += loss.item()
+            scheduler.step()
+            avg = total / len(loader)
+            epoch_time = time.time() - epoch_start
+            current_lr = optimizer.param_groups[0]["lr"]
+
+            if avg < best_loss:
+                best_loss = avg
+                torch.save(net.state_dict(), os.path.join(ckpt_dir, "channel_score_best.pt"))
+
+            # --- Log every epoch to CSV ---
+            with open(csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    epoch + 1, f"{avg:.6f}", f"{current_lr:.8f}",
+                    f"{epoch_time:.2f}", f"{best_loss:.6f}",
+                    datetime.now().isoformat()
+                ])
+
+            history.append({
+                "epoch": epoch + 1,
+                "avg_loss": avg,
+                "lr": current_lr,
+                "epoch_time_sec": epoch_time,
+                "best_loss_so_far": best_loss,
+            })
+
+            # Log to console/file every epoch (not just every 20) so overnight
+            # runs have a full record; console spam is fine since it's also going to file.
+            logger.info(
+                f"Epoch {epoch+1}/{epochs} | loss={avg:.6f} | lr={current_lr:.8f} "
+                f"| best={best_loss:.6f} | time={epoch_time:.2f}s"
+            )
+
+        torch.save(net.state_dict(), os.path.join(ckpt_dir, "channel_score_final.pt"))
+        total_time = time.time() - run_start
+        logger.info(f"Channel score network training complete. Total time: {total_time:.2f}s")
+
+        # --- Final summary JSON ---
+        summary = {
+            "run_name": run_name,
+            "status": "completed",
+            "config": cfg,
+            "total_epochs": epochs,
+            "total_time_sec": total_time,
+            "best_loss": best_loss,
+            "final_loss": history[-1]["avg_loss"] if history else None,
+            "device": str(device),
+            "checkpoint_best": os.path.join(ckpt_dir, "channel_score_best.pt"),
+            "checkpoint_final": os.path.join(ckpt_dir, "channel_score_final.pt"),
+            "history": history,
+        }
+        summary_path = os.path.join(log_dir, f"{run_name}_summary.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        logger.info(f"Summary written to {summary_path}")
+        logger.info(f"Per-epoch metrics CSV: {csv_path}")
+        logger.info(f"Full log: {log_path}")
+
+    except Exception as e:
+        # Make sure a crash overnight still leaves a readable record of what happened
+        logger.error(f"Training crashed at epoch {len(history)+1}: {e}")
+        logger.error(traceback.format_exc())
+
+        crash_summary = {
+            "run_name": run_name,
+            "status": "crashed",
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "epochs_completed": len(history),
+            "best_loss": best_loss,
+            "history": history,
+        }
+        crash_path = os.path.join(log_dir, f"{run_name}_CRASHED.json")
+        with open(crash_path, "w") as f:
+            json.dump(crash_summary, f, indent=2, default=str)
+        logger.error(f"Crash report written to {crash_path}")
+        raise  # still fail loudly, but now with files on disk to inspect
 
 
 def main():
@@ -119,7 +234,7 @@ def main():
     args = parser.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    train(cfg)
+    train(cfg, config_path=args.config)
 
 
 if __name__ == "__main__":

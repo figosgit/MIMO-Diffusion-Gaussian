@@ -1,0 +1,51 @@
+# Minimal config for RunPod quick training (1-2 hours)
+# Trade-off: smaller models, fewer epochs, but complete pipeline
+
+channel: rayleigh
+Nr: 2              # Reduce from 4
+Nt: 1
+K: 16              # HUGE reduction from 192 (saves 12x parameters)
+T: 24
+Nu: 1              # Single user
+cbr: 0.5555        # Nt*K*T / n = 1*16*24 / (256*256*3)
+
+snr_db_range: [0, 10, 20]  # Fewer SNRs to eval
+
+# Encoder - lightweight
+embed_dim: 32      # Reduce from 96
+depths: [1, 1, 2, 1]  # Reduce from [2,2,6,2]
+num_heads: [2, 4, 8, 16]  # Reduce proportionally
+dec_depths: [1, 2, 1, 1]
+dec_num_heads: [16, 8, 4, 2]
+patch_size: 4
+power: 1.0
+
+# Training
+data_root: data/mnist256/all
+epochs: 5          # Down from 100 (5x faster)
+batch_size: 16     # Down from 32
+lr: 1.0e-4
+
+# Score networks - CRITICAL for speed
+score_base_channels: 16  # Down from 32
+score_ch_mults: [1, 2]   # Reduce from [1,2,2]
+score_num_res_blocks: 1
+score_attn_resolutions: []  # Remove attention (saves 40%)
+score_dropout: 0.1
+score_lr: 2.0e-4
+score_epochs: 10   # Down from 200 (20x faster!)
+score_batch_size: 32
+
+# AR(1) temporal config
+alpha: 0.7
+time_steps: 5      # Down from 20
+use_temporal_context: true
+
+# PVD (inference)
+J: 5               # Down from 10
+J_in: 3            # Down from 5
+L: 1
+sigma_H_1: 0.01
+sigma_H_J: 10.0
+sigma_D_1: 0.01
+sigma_D_J: 10.0
