@@ -1,51 +1,114 @@
-# Minimal config for RunPod quick training (1-2 hours)
-# Trade-off: smaller models, fewer epochs, but complete pipeline
+# ============================================================
+# MIMO-Diffusion-Gaussian
+# Minimal RunPod configuration
+# ============================================================
+
+
+# ============================================================
+# Channel model
+# ============================================================
 
 channel: rayleigh
-Nr: 2              # Reduce from 4
+
+Nr: 2
 Nt: 1
-K: 16              # HUGE reduction from 192 (saves 12x parameters)
+K: 16
+Nu: 1
+
+# Number of channel symbols / time steps used by the full system.
 T: 24
-Nu: 1              # Single user
-cbr: 0.5555        # Nt*K*T / n = 1*16*24 / (256*256*3)
 
-snr_db_range: [0, 10, 20]  # Fewer SNRs to eval
+# Code-rate / bandwidth-related configuration.
+cbr: 0.5555
 
-# Encoder - lightweight
-embed_dim: 32      # Reduce from 96
-depths: [1, 1, 2, 1]  # Reduce from [2,2,6,2]
-num_heads: [2, 4, 8, 16]  # Reduce proportionally
+
+# ============================================================
+# SNR evaluation
+# ============================================================
+
+snr_db_range: [0, 10, 20]
+
+
+# ============================================================
+# Encoder / decoder
+# ============================================================
+
+embed_dim: 32
+
+depths: [1, 1, 2, 1]
+num_heads: [2, 4, 8, 16]
+
 dec_depths: [1, 2, 1, 1]
 dec_num_heads: [16, 8, 4, 2]
+
 patch_size: 4
 power: 1.0
 
-# Training
+
+# ============================================================
+# Main encoder/decoder training
+# ============================================================
+
 data_root: data/mnist256/all
-epochs: 5          # Down from 100 (5x faster)
-batch_size: 16     # Down from 32
+
+epochs: 5
+batch_size: 16
 lr: 1.0e-4
 
-# Score networks - CRITICAL for speed
-score_base_channels: 16  # Down from 32
-score_ch_mults: [1, 2]   # Reduce from [1,2,2]
-score_num_res_blocks: 1
-score_attn_resolutions: []  # Remove attention (saves 40%)
-score_dropout: 0.1
-score_lr: 2.0e-4
-score_epochs: 10   # Down from 200 (20x faster!)
-score_batch_size: 32
 
-# AR(1) temporal config
-alpha: 0.7
-time_steps: 5      # Down from 20
-use_temporal_context: true
+# ============================================================
+# Channel score network
+#
+# The current ChannelScoreNet is an epsilon-prediction model:
+#
+#     H_sigma = H_0 + sigma * epsilon
+#
+#     network(H_sigma, sigma) ~= -epsilon
+#
+# and therefore:
+#
+#     score(H_sigma, sigma)
+#         = network(H_sigma, sigma) / sigma
+#
+# ============================================================
 
-# PVD (inference)
-J: 5               # Down from 10
-J_in: 3            # Down from 5
-L: 1
+channel_J: 50
+
 sigma_H_1: 0.01
 sigma_H_J: 10.0
+
+channel_hidden_dim: 1024
+channel_num_layers: 8
+channel_time_dim: 512
+
+score_lr: 2.0e-4
+score_lr_min: 1.0e-5
+score_weight_decay: 1.0e-4
+
+score_epochs: 500
+score_batch_size: 128
+
+# Number of Rayleigh channel samples generated per epoch.
+# 2560 / 128 = 20 optimizer steps per epoch.
+score_samples_per_epoch: 2560
+
+
+# ============================================================
+# Temporal channel configuration
+# ============================================================
+
+alpha: 0.7
+time_steps: 50
+use_temporal_context: true
+
+
+# ============================================================
+# PVD inference
+# ============================================================
+
+J: 5
+J_in: 3
+L: 1
+
 sigma_D_1: 0.01
 sigma_D_J: 10.0

@@ -294,9 +294,9 @@ class ChannelScoreNet(nn.Module):
         Nr: int,
         Nt: int,
         K: int,
-        hidden_dim: int = 512,
-        num_layers: int = 6,
-        time_dim: int = 256,
+        hidden_dim: int = 1024,
+        num_layers: int = 8,
+        time_dim: int = 512,
     ):
         super().__init__()
         self.NrK = Nr * K
@@ -329,10 +329,10 @@ class ChannelScoreNet(nn.Module):
         t_emb = self.time_emb(sigma)
         inp = torch.cat([h_flat, t_emb], dim=-1)
         out = self.net(inp)
-        score = out.view_as(H)
-        # Score parameterization: divide by sigma^2
-        score = score / (sigma[:, None, None, None] ** 2 + 1e-8)
-        return score
+        # score = out.view_as(H)
+        # # Score parameterization: divide by sigma^2
+        # score = score / (sigma[:, None, None, None] ** 2 + 1e-8)
+        return out.view_as(H)
 
 
 class ChannelScoreNet2ndOrder(nn.Module):
