@@ -334,6 +334,126 @@ class ChannelScoreNet(nn.Module):
         # score = score / (sigma[:, None, None, None] ** 2 + 1e-8)
         return out.view_as(H)
 
+class ChannelTemporalScoreNet(nn.Module):
+    """
+    Temporal score network for MIMO channel H.
+
+    Models the conditional distribution:
+
+        q(H_t | H_{t-1})
+
+    The network receives:
+      - H_t:     noisy current channel
+      - H_prev:  previous clean channel
+      - sigma:   noise level applied to H_t
+
+    H_t and H_prev are represented using their real and imaginary parts
+    as two channels.
+
+    The network predicts -epsilon, matching the parameterization used
+    by ChannelScoreNet.
+    """
+
+    def __init__(
+        self,
+        Nr: int,
+        Nt: int,
+        K: int,
+        hidden_dim: int = 1024,
+        num_layers: int = 8,
+        time_dim: int = 512,
+    ):
+        super().__init__()
+
+        self.NrK = Nr * K
+        self.NtK = Nt * K
+
+        # One complex H represented as:
+        #   2 x NrK x NtK
+        #
+        # Therefore:
+        #   h_dim = real + imag
+        self.h_dim = 2 * Nr * K * Nt * K
+
+        # We feed both H_t and H_{t-1}.
+        self.in_dim = 2 * self.h_dim
+
+        self.time_emb = TimeEmbedding(time_dim, time_dim)
+
+        layers = []
+        in_d = self.in_dim + time_dim
+
+        for i in range(num_layers):
+            out_d = hidden_dim if i < num_layers - 1 else self.h_dim
+            layers.append(nn.Linear(in_d, out_d))
+
+            if i < num_layers - 1:
+                layers.append(nn.SiLU())
+
+            in_d = hidden_dim
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(
+        self,
+        H: torch.Tensor,
+        H_prev: torch.Tensor,
+        sigma: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            H:
+                Noisy current channel.
+
+                Shape:
+                    (B, 2, NrK, NtK)
+
+                Channel 0 = real part
+                Channel 1 = imaginary part
+
+            H_prev:
+                Previous clean channel.
+
+                Shape:
+                    (B, 2, NrK, NtK)
+
+            sigma:
+                Noise level.
+
+                Shape:
+                    (B,)
+
+        Returns:
+            Predicted -epsilon with shape:
+
+                (B, 2, NrK, NtK)
+        """
+
+        B = H.shape[0]
+
+        # Flatten current and previous channels independently.
+        h_flat = H.reshape(B, -1)
+        h_prev_flat = H_prev.reshape(B, -1)
+
+        # Encode the noise level.
+        t_emb = self.time_emb(sigma)
+
+        # Conditional input:
+        #
+        #   [ H_t | H_{t-1} | sigma_embedding ]
+        #
+        inp = torch.cat(
+            [h_flat, h_prev_flat, t_emb],
+            dim=-1,
+        )
+
+        out = self.net(inp)
+
+        # Linear layer outputs a flat vector.
+        # Restore the channel representation expected by the DSM loss.
+        return out.view_as(H)
+
+
 
 class ChannelScoreNet2ndOrder(nn.Module):
     """

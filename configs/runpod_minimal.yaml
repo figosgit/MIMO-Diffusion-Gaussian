@@ -112,3 +112,11 @@ L: 1
 
 sigma_D_1: 0.01
 sigma_D_J: 10.0
+
+
+
+
+
+channel_temporal: true
+channel_ar1_alpha: 0.7
+channel_sequence_length: 20

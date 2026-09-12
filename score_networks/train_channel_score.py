@@ -1,20 +1,29 @@
 """
 Train channel score network q_{theta_H}.
 
-The network uses an epsilon parameterization. Given
+Supports two modes:
 
-    H_j = H_0 + sigma_j * epsilon,
+1. Independent:
+       H_j = H_0 + sigma * epsilon
 
-it learns
+       epsilon_theta(H_j, sigma) ~= -epsilon
 
-    epsilon_theta(H_j, sigma_j) ~= -epsilon.
+2. Temporal AR(1):
+       H_t = alpha * H_{t-1} + sqrt(1 - alpha^2) * W_t
 
-The corresponding conditional score is
+       H_j = H_t + sigma * epsilon
 
-    s_theta(H_j, sigma_j)
-        = epsilon_theta(H_j, sigma_j) / sigma_j.
+       epsilon_theta(H_j, H_{t-1}, sigma) ~= -epsilon
 
-H_0 is drawn from the i.i.d. Rayleigh channel prior.
+Config:
+
+    channel_temporal: false
+
+or:
+
+    channel_temporal: true
+    channel_ar1_alpha: 0.7
+    channel_sequence_length: 20
 
 Usage:
     python -m score_networks.train_channel_score \
@@ -37,16 +46,30 @@ import torch.optim as optim
 import yaml
 from torch.utils.data import DataLoader, TensorDataset
 
-from .ncsnpp import ChannelScoreNet
-from channels.rayleigh import generate_rayleigh_channel
+from .ncsnpp import (
+    ChannelScoreNet,
+    ChannelTemporalScoreNet,
+)
+
+from channels.rayleigh import (
+    generate_rayleigh_channel,
+    generate_rayleigh_channel_sequence,
+)
 
 
 def setup_logging(log_dir: str, run_name: str):
-    """Set up file + console logging and initialize the CSV metrics file."""
+    """Set up file + console logging and initialize CSV metrics."""
     os.makedirs(log_dir, exist_ok=True)
 
-    log_path = os.path.join(log_dir, f"{run_name}.log")
-    csv_path = os.path.join(log_dir, f"{run_name}_metrics.csv")
+    log_path = os.path.join(
+        log_dir,
+        f"{run_name}.log",
+    )
+
+    csv_path = os.path.join(
+        log_dir,
+        f"{run_name}_metrics.csv",
+    )
 
     logger = logging.getLogger(run_name)
     logger.setLevel(logging.INFO)
@@ -54,13 +77,17 @@ def setup_logging(log_dir: str, run_name: str):
 
     file_handler = logging.FileHandler(log_path)
     file_handler.setFormatter(
-        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(message)s"
+        )
     )
     logger.addHandler(file_handler)
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(
-        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(message)s"
+        )
     )
     logger.addHandler(console_handler)
 
@@ -84,12 +111,7 @@ def sample_log_sigma(
     sigma_max: float,
     device: torch.device,
 ):
-    """
-    Sample sigma continuously and uniformly in log-space.
-
-    This gives equal probability to each order of magnitude instead of
-    over/under-representing particular noise scales.
-    """
+    """Sample sigma continuously and uniformly in log-space."""
     log_sigma_min = math.log(sigma_min)
     log_sigma_max = math.log(sigma_max)
 
@@ -109,7 +131,7 @@ def epsilon_dsm_loss(
     sigma_max: float,
 ):
     """
-    Epsilon-parameterized denoising score matching.
+    Epsilon-parameterized DSM for independent channels.
 
     H_j = H_0 + sigma * epsilon
 
@@ -118,13 +140,6 @@ def epsilon_dsm_loss(
 
     Network:
         epsilon_pred = net(H_j, sigma)
-
-    Loss:
-        E[ ||epsilon_pred + epsilon||^2 ]
-
-    The sigma^2 weighting used in the old implementation is intentionally
-    removed because the network output is now epsilon-parameterized rather
-    than direct-score-parameterized.
     """
     batch_size = H0.shape[0]
     device = H0.device
@@ -141,12 +156,6 @@ def epsilon_dsm_loss(
 
     sigma_3d = sigma[:, None, None]
 
-    # ------------------------------------------------------------
-    # Perturb the channel
-    #
-    # H_j = H_0 + sigma * epsilon
-    # ------------------------------------------------------------
-
     H_j_real = H0.real + sigma_3d * eps_real
     H_j_imag = H0.imag + sigma_3d * eps_imag
 
@@ -155,22 +164,10 @@ def epsilon_dsm_loss(
         dim=1,
     )
 
-    # ------------------------------------------------------------
-    # Network input
-    #
-    # Keep the same normalization convention currently used by
-    # ChannelScoreNet.
-    # ------------------------------------------------------------
-
-    H_j_norm = H_j / sigma[:, None, None, None]
-
-    # ------------------------------------------------------------
-    # Epsilon target
-    #
-    # score = -epsilon / sigma
-    #
-    # network output = -epsilon
-    # ------------------------------------------------------------
+    H_j_norm = (
+        H_j
+        / sigma[:, None, None, None]
+    )
 
     epsilon_target = torch.stack(
         [-eps_real, -eps_imag],
@@ -182,9 +179,94 @@ def epsilon_dsm_loss(
         sigma,
     )
 
-    # ------------------------------------------------------------
-    # Unweighted epsilon loss
-    # ------------------------------------------------------------
+    loss = (
+        epsilon_pred - epsilon_target
+    ).pow(2).mean()
+
+    return loss
+
+
+def temporal_epsilon_dsm_loss(
+    net: nn.Module,
+    H_curr: torch.Tensor,
+    H_prev: torch.Tensor,
+    sigma_min: float,
+    sigma_max: float,
+):
+    """
+    Epsilon-parameterized DSM for temporal channels.
+
+    H_j = H_t + sigma * epsilon
+
+    The network receives:
+
+        H_j
+        H_{t-1}
+        sigma
+
+    and learns:
+
+        epsilon_theta(H_j, H_{t-1}, sigma) ~= -epsilon
+    """
+    batch_size = H_curr.shape[0]
+    device = H_curr.device
+
+    sigma = sample_log_sigma(
+        batch_size,
+        sigma_min,
+        sigma_max,
+        device,
+    )
+
+    eps_real = torch.randn_like(H_curr.real)
+    eps_imag = torch.randn_like(H_curr.imag)
+
+    sigma_3d = sigma[:, None, None]
+
+    # Perturb only H_t.
+    H_j_real = (
+        H_curr.real
+        + sigma_3d * eps_real
+    )
+
+    H_j_imag = (
+        H_curr.imag
+        + sigma_3d * eps_imag
+    )
+
+    H_j = torch.stack(
+        [H_j_real, H_j_imag],
+        dim=1,
+    )
+
+    # Same normalization used by the existing channel model.
+    H_j_norm = (
+        H_j
+        / sigma[:, None, None, None]
+    )
+
+    # H_{t-1} remains clean.
+    H_prev_input = torch.stack(
+        [
+            H_prev.real,
+            H_prev.imag,
+        ],
+        dim=1,
+    )
+
+    epsilon_target = torch.stack(
+        [
+            -eps_real,
+            -eps_imag,
+        ],
+        dim=1,
+    )
+
+    epsilon_pred = net(
+        H_j_norm,
+        H_prev_input,
+        sigma,
+    )
 
     loss = (
         epsilon_pred - epsilon_target
@@ -195,23 +277,31 @@ def epsilon_dsm_loss(
 
 def train(cfg: dict, config_path: str = ""):
     device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
     )
 
     # ============================================================
     # Logging
     # ============================================================
 
-    log_dir = cfg.get("log_dir", "logs")
+    log_dir = cfg.get(
+        "log_dir",
+        "logs",
+    )
 
     run_name = (
         cfg.get("run_name")
-        or os.path.splitext(os.path.basename(config_path))[0]
+        or os.path.splitext(
+            os.path.basename(config_path)
+        )[0]
         or "run"
     )
 
     run_name = (
-        f"{run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        f"{run_name}_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
 
     logger, csv_path, log_path = setup_logging(
@@ -233,6 +323,33 @@ def train(cfg: dict, config_path: str = ""):
     Nt = cfg.get("Nt", 1)
     K = cfg.get("K", 192)
     Nu = cfg.get("Nu", 1)
+
+    channel_temporal = cfg.get(
+        "channel_temporal",
+        False,
+    )
+
+    alpha = cfg.get(
+        "channel_ar1_alpha",
+        0.7,
+    )
+
+    sequence_length = cfg.get(
+        "channel_sequence_length",
+        20,
+    )
+
+    if channel_temporal:
+        if not 0.0 <= alpha < 1.0:
+            raise ValueError(
+                f"channel_ar1_alpha must satisfy "
+                f"0 <= alpha < 1, got {alpha}"
+            )
+
+        if sequence_length < 2:
+            raise ValueError(
+                "channel_sequence_length must be >= 2"
+            )
 
     # IMPORTANT:
     # channel_J is independent from the PVD J.
@@ -263,7 +380,8 @@ def train(cfg: dict, config_path: str = ""):
         )
 
     logger.info(
-        f"Channel dimensions: Nr={Nr}, Nt={Nt}, K={K}, Nu={Nu}"
+        f"Channel dimensions: "
+        f"Nr={Nr}, Nt={Nt}, K={K}, Nu={Nu}"
     )
 
     logger.info(
@@ -271,30 +389,64 @@ def train(cfg: dict, config_path: str = ""):
     )
 
     logger.info(
-        f"Continuous log-sigma sampling enabled"
+        "Continuous log-sigma sampling enabled"
     )
+
+    if channel_temporal:
+        logger.info(
+            "Channel training mode: TEMPORAL AR(1)"
+        )
+        logger.info(
+            f"AR(1) alpha: {alpha}"
+        )
+        logger.info(
+            f"Sequence length: {sequence_length}"
+        )
+    else:
+        logger.info(
+            "Channel training mode: INDEPENDENT"
+        )
 
     # ============================================================
     # Network
     # ============================================================
 
-    net = ChannelScoreNet(
-        Nr=Nr,
-        Nt=Nt,
-        K=K,
-        hidden_dim=cfg.get(
-            "channel_hidden_dim",
-            1024,
-        ),
-        num_layers=cfg.get(
-            "channel_num_layers",
-            8,
-        ),
-        time_dim=cfg.get(
-            "channel_time_dim",
-            512,
-        ),
-    ).to(device)
+    if channel_temporal:
+        net = ChannelTemporalScoreNet(
+            Nr=Nr,
+            Nt=Nt,
+            K=K,
+            hidden_dim=cfg.get(
+                "channel_hidden_dim",
+                1024,
+            ),
+            num_layers=cfg.get(
+                "channel_num_layers",
+                8,
+            ),
+            time_dim=cfg.get(
+                "channel_time_dim",
+                512,
+            ),
+        ).to(device)
+    else:
+        net = ChannelScoreNet(
+            Nr=Nr,
+            Nt=Nt,
+            K=K,
+            hidden_dim=cfg.get(
+                "channel_hidden_dim",
+                1024,
+            ),
+            num_layers=cfg.get(
+                "channel_num_layers",
+                8,
+            ),
+            time_dim=cfg.get(
+                "channel_time_dim",
+                512,
+            ),
+        ).to(device)
 
     num_parameters = sum(
         p.numel()
@@ -371,15 +523,26 @@ def train(cfg: dict, config_path: str = ""):
         exist_ok=True,
     )
 
-    best_checkpoint = os.path.join(
-        ckpt_dir,
-        "channel_score_best.pt",
-    )
+    if channel_temporal:
+        best_checkpoint = os.path.join(
+            ckpt_dir,
+            "channel_score_temporal_best.pt",
+        )
 
-    final_checkpoint = os.path.join(
-        ckpt_dir,
-        "channel_score_final.pt",
-    )
+        final_checkpoint = os.path.join(
+            ckpt_dir,
+            "channel_score_temporal_final.pt",
+        )
+    else:
+        best_checkpoint = os.path.join(
+            ckpt_dir,
+            "channel_score_best.pt",
+        )
+
+        final_checkpoint = os.path.join(
+            ckpt_dir,
+            "channel_score_final.pt",
+        )
 
     # ============================================================
     # Training state
@@ -402,10 +565,16 @@ def train(cfg: dict, config_path: str = ""):
         f"Samples per epoch: {samples_per_epoch}"
     )
 
-    logger.info(
-        f"Steps per epoch: "
-        f"{math.ceil(samples_per_epoch / batch_size)}"
-    )
+    if channel_temporal:
+        logger.info(
+            f"Training pairs per epoch: "
+            f"{samples_per_epoch * (sequence_length - 1)}"
+        )
+    else:
+        logger.info(
+            f"Training samples per epoch: "
+            f"{samples_per_epoch}"
+        )
 
     # ============================================================
     # Training
@@ -417,27 +586,89 @@ def train(cfg: dict, config_path: str = ""):
 
             net.train()
 
-            # ----------------------------------------------------
-            # Generate fresh Rayleigh channels.
-            # ----------------------------------------------------
+            # ====================================================
+            # Generate data
+            # ====================================================
 
-            H0 = generate_rayleigh_channel(
-                samples_per_epoch,
-                Nu,
-                Nr,
-                Nt,
-                K,
-                device,
-            )
+            if channel_temporal:
 
-            # Select the first user.
-            #
-            # Shape:
-            #   (B, Nr*K, Nt*K)
-            #
-            H0 = H0[:, 0]
+                # H_seq:
+                # (B, T, Nu, Nr*K, Nt*K)
 
-            dataset = TensorDataset(H0)
+                H_seq = generate_rayleigh_channel_sequence(
+                    samples_per_epoch,
+                    Nu,
+                    Nr,
+                    Nt,
+                    K,
+                    sequence_length,
+                    alpha=alpha,
+                    device=device,
+                )
+
+                # Use first user:
+                # (B, T, Nr*K, Nt*K)
+
+                H_seq = H_seq[:, :, 0]
+
+                # Previous/current pairs:
+                #
+                # H_prev:
+                # H_0, H_1, ..., H_{T-2}
+                #
+                # H_curr:
+                # H_1, H_2, ..., H_{T-1}
+
+                H_prev = H_seq[:, :-1]
+                H_curr = H_seq[:, 1:]
+
+                # Flatten sequence dimension.
+                #
+                # (B, T-1, Nr*K, Nt*K)
+                #       ↓
+                # (B*(T-1), Nr*K, Nt*K)
+
+                H_prev = H_prev.reshape(
+                    -1,
+                    Nr * K,
+                    Nt * K,
+                )
+
+                H_curr = H_curr.reshape(
+                    -1,
+                    Nr * K,
+                    Nt * K,
+                )
+
+                dataset = TensorDataset(
+                    H_curr,
+                    H_prev,
+                )
+
+            else:
+
+                # H0:
+                # (B, Nu, Nr*K, Nt*K)
+
+                H0 = generate_rayleigh_channel(
+                    samples_per_epoch,
+                    Nu,
+                    Nr,
+                    Nt,
+                    K,
+                    device,
+                )
+
+                # First user:
+                # (B, Nr*K, Nt*K)
+
+                H0 = H0[:, 0]
+
+                dataset = TensorDataset(H0)
+
+            # ====================================================
+            # DataLoader
+            # ====================================================
 
             loader = DataLoader(
                 dataset,
@@ -449,13 +680,34 @@ def train(cfg: dict, config_path: str = ""):
             total_loss = 0.0
             num_steps = 0
 
-            for (H0_batch,) in loader:
-                loss = epsilon_dsm_loss(
-                    net,
-                    H0_batch,
-                    sigma_min,
-                    sigma_max,
-                )
+            # ====================================================
+            # Optimization
+            # ====================================================
+
+            for batch in loader:
+
+                if channel_temporal:
+
+                    H_curr_batch, H_prev_batch = batch
+
+                    loss = temporal_epsilon_dsm_loss(
+                        net,
+                        H_curr_batch,
+                        H_prev_batch,
+                        sigma_min,
+                        sigma_max,
+                    )
+
+                else:
+
+                    (H0_batch,) = batch
+
+                    loss = epsilon_dsm_loss(
+                        net,
+                        H0_batch,
+                        sigma_min,
+                        sigma_max,
+                    )
 
                 optimizer.zero_grad(
                     set_to_none=True
@@ -473,6 +725,10 @@ def train(cfg: dict, config_path: str = ""):
                 total_loss += loss.item()
                 num_steps += 1
 
+            # ====================================================
+            # Scheduler
+            # ====================================================
+
             scheduler.step()
 
             avg_loss = (
@@ -482,16 +738,17 @@ def train(cfg: dict, config_path: str = ""):
             )
 
             epoch_time = (
-                time.time() - epoch_start
+                time.time()
+                - epoch_start
             )
 
             current_lr = (
                 optimizer.param_groups[0]["lr"]
             )
 
-            # ----------------------------------------------------
+            # ====================================================
             # Best checkpoint
-            # ----------------------------------------------------
+            # ====================================================
 
             if avg_loss < best_loss:
                 best_loss = avg_loss
@@ -501,9 +758,9 @@ def train(cfg: dict, config_path: str = ""):
                     best_checkpoint,
                 )
 
-            # ----------------------------------------------------
+            # ====================================================
             # History
-            # ----------------------------------------------------
+            # ====================================================
 
             history_entry = {
                 "epoch": epoch + 1,
@@ -515,9 +772,9 @@ def train(cfg: dict, config_path: str = ""):
 
             history.append(history_entry)
 
-            # ----------------------------------------------------
+            # ====================================================
             # CSV
-            # ----------------------------------------------------
+            # ====================================================
 
             with open(
                 csv_path,
@@ -535,9 +792,9 @@ def train(cfg: dict, config_path: str = ""):
                     datetime.now().isoformat(),
                 ])
 
-            # ----------------------------------------------------
+            # ====================================================
             # Logging
-            # ----------------------------------------------------
+            # ====================================================
 
             logger.info(
                 f"Epoch {epoch + 1}/{epochs} | "
@@ -557,11 +814,12 @@ def train(cfg: dict, config_path: str = ""):
         )
 
         total_time = (
-            time.time() - run_start
+            time.time()
+            - run_start
         )
 
         logger.info(
-            f"Channel score network training complete. "
+            "Channel score network training complete. "
             f"Total time: {total_time:.2f}s"
         )
 
@@ -573,6 +831,17 @@ def train(cfg: dict, config_path: str = ""):
             "run_name": run_name,
             "status": "completed",
             "config": cfg,
+            "temporal": channel_temporal,
+            "ar1_alpha": (
+                alpha
+                if channel_temporal
+                else None
+            ),
+            "sequence_length": (
+                sequence_length
+                if channel_temporal
+                else None
+            ),
             "total_epochs": epochs,
             "total_time_sec": total_time,
             "best_loss": best_loss,
@@ -592,7 +861,10 @@ def train(cfg: dict, config_path: str = ""):
             f"{run_name}_summary.json",
         )
 
-        with open(summary_path, "w") as f:
+        with open(
+            summary_path,
+            "w",
+        ) as f:
             json.dump(
                 summary,
                 f,
@@ -613,6 +885,7 @@ def train(cfg: dict, config_path: str = ""):
         )
 
     except Exception as e:
+
         # ========================================================
         # Crash report
         # ========================================================
@@ -633,6 +906,17 @@ def train(cfg: dict, config_path: str = ""):
             "traceback": traceback.format_exc(),
             "epochs_completed": len(history),
             "best_loss": best_loss,
+            "temporal": channel_temporal,
+            "ar1_alpha": (
+                alpha
+                if channel_temporal
+                else None
+            ),
+            "sequence_length": (
+                sequence_length
+                if channel_temporal
+                else None
+            ),
             "history": history,
         }
 
@@ -641,7 +925,10 @@ def train(cfg: dict, config_path: str = ""):
             f"{run_name}_CRASHED.json",
         )
 
-        with open(crash_path, "w") as f:
+        with open(
+            crash_path,
+            "w",
+        ) as f:
             json.dump(
                 crash_summary,
                 f,

@@ -196,3 +196,67 @@ def lmmse_channel_estimate(
     # Solve: H_hat = C @ G_reg^{-1}
     H_hat = torch.linalg.solve(G_reg.transpose(-2, -1), C.transpose(-2, -1)).transpose(-2, -1)
     return H_hat
+
+
+def generate_rayleigh_channel_sequence(
+    batch_size: int,
+    Nu: int,
+    Nr: int,
+    Nt: int,
+    K: int,
+    T: int,
+    alpha: float = 0.7,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """
+    Generate temporally correlated Rayleigh fading channel sequences
+    using a complex AR(1) process:
+
+        H_t = alpha * H_{t-1} + sqrt(1 - alpha^2) * W_t
+
+    where W_t ~ CN(0, I) is an independent Rayleigh channel.
+
+    Args:
+        batch_size: Number of channel sequences.
+        Nu: Number of users.
+        Nr: Number of receive antennas.
+        Nt: Number of transmit antennas per user.
+        K: Number of transmission blocks.
+        T: Sequence length.
+        alpha: Temporal correlation coefficient.
+        device: Computation device.
+
+    Returns:
+        H_seq: (batch, T, Nu, Nr*K, Nt*K) complex64 tensor.
+    """
+    if not 0 <= alpha < 1:
+        raise ValueError("alpha must satisfy 0 <= alpha < 1")
+
+    H_seq = torch.empty(
+        batch_size,
+        T,
+        Nu,
+        Nr * K,
+        Nt * K,
+        dtype=torch.complex64,
+        device=device,
+    )
+
+    # H_0 ~ CN(0, I)
+    H_seq[:, 0] = generate_rayleigh_channel(
+        batch_size, Nu, Nr, Nt, K, device
+    )
+
+    innovation_scale = math.sqrt(1.0 - alpha ** 2)
+
+    for t in range(1, T):
+        W_t = generate_rayleigh_channel(
+            batch_size, Nu, Nr, Nt, K, device
+        )
+
+        H_seq[:, t] = (
+            alpha * H_seq[:, t - 1]
+            + innovation_scale * W_t
+        )
+
+    return H_seq
