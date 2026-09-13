@@ -1,51 +1,23 @@
 """
 Evaluate the channel score network.
 
-The current channel network uses epsilon parameterization:
+Supports:
 
-    H_sigma = H_0 + sigma * epsilon
+1. Standard evaluation on i.i.d. Rayleigh channels.
+2. Evaluation of the SAME non-temporal model on temporal AR(1) data.
 
-    epsilon_theta(H_sigma, sigma) ~= E[-epsilon | H_sigma]
+In temporal-data mode, the model still receives only:
 
-and therefore:
+    H_sigma / sigma, sigma
 
-    score_theta(H_sigma, sigma)
-        = epsilon_theta(H_sigma, sigma) / sigma
+It does NOT receive H_prev.
 
-For an i.i.d. Gaussian/Rayleigh channel, the noisy marginal remains
-Gaussian, so the exact marginal score is available analytically.
+H_prev is only used to construct the analytical temporal conditional
+score target:
 
-If each real/imaginary component of H_0 has variance v:
-
-    H_sigma ~ N(0, v + sigma^2)
-
-and therefore:
-
-    score*(H_sigma, sigma)
-        = -H_sigma / (v + sigma^2)
-
-This evaluator reports:
-
-1. Epsilon MSE against the sampled -epsilon target.
-   This is a DSM training diagnostic, NOT the main quality metric.
-
-2. Analytical score MSE.
-
-3. Analytical score relative error.
-
-4. Score cosine similarity.
-
-5. Mean metrics across all evaluation sigmas.
-
-Usage:
-
-    python -m score_networks.evaluate_channel_score \
-        --config configs/runpod_minimal.yaml \
-        --checkpoint score_networks/checkpoints/channel_score_best.pt
-
-    python -m score_networks.evaluate_channel_score \
-        --config configs/runpod_minimal.yaml \
-        --checkpoint score_networks/checkpoints/channel_score_final.pt
+    score*(H_sigma | H_prev)
+        = -(H_sigma - alpha * H_prev)
+          / ((1 - alpha^2) * v + sigma^2)
 """
 
 import argparse
@@ -56,7 +28,10 @@ import torch
 import yaml
 
 from .ncsnpp import ChannelScoreNet
-from channels.rayleigh import generate_rayleigh_channel
+from channels.rayleigh import (
+    generate_rayleigh_channel,
+    generate_rayleigh_channel_sequence,
+)
 
 
 def build_sigma_schedule(
@@ -106,13 +81,12 @@ def estimate_channel_variance(
     H0: torch.Tensor,
 ) -> float:
     """
-    Estimate the variance of one real-valued channel component.
-
-    H0 has shape:
-
+    H0 shape:
         (B, 2, Nr*K, Nt*K)
 
-    where channel dimension 1 is [real, imag].
+    Dimension 1 contains:
+        0 -> real
+        1 -> imaginary
     """
     real_var = H0[:, 0].var(unbiased=False)
     imag_var = H0[:, 1].var(unbiased=False)
@@ -128,12 +102,25 @@ def evaluate_sigma(
     H0: torch.Tensor,
     sigma: float,
     channel_variance: float,
+    H_prev: torch.Tensor | None = None,
+    alpha: float = 0.7,
 ):
     """
-    Evaluate one noise level on one batch of clean channels.
+    Evaluate one sigma on one batch.
 
-    The batch must be small enough to fit comfortably on the GPU.
+    H0:
+        Current clean channel.
+
+    H_prev:
+        Previous clean channel.
+
+        If None:
+            evaluate against marginal score.
+
+        Otherwise:
+            evaluate against temporal conditional score.
     """
+
     device = H0.device
     batch_size = H0.shape[0]
 
@@ -145,7 +132,7 @@ def evaluate_sigma(
     )
 
     eps_real = torch.randn_like(H0[:, 0])
-    eps_imag = torch.randn_like(H0[:, 0])
+    eps_imag = torch.randn_like(H0[:, 1])
 
     H_sigma_real = (
         H0[:, 0]
@@ -165,13 +152,12 @@ def evaluate_sigma(
         dim=1,
     )
 
-    # Match the exact preprocessing used during training.
+    # Exact preprocessing used by the non-temporal model.
     H_sigma_input = (
         H_sigma
         / sigma_tensor[:, None, None, None]
     )
 
-    # Network predicts epsilon, not the score directly.
     epsilon_pred = net(
         H_sigma_input,
         sigma_tensor,
@@ -185,13 +171,11 @@ def evaluate_sigma(
         dim=1,
     )
 
-    # ------------------------------------------------------------
-    # Epsilon diagnostic.
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------
+    # Epsilon metrics
+    # ---------------------------------------------------------
 
-    epsilon_error = (
-        epsilon_pred - epsilon_target
-    )
+    epsilon_error = epsilon_pred - epsilon_target
 
     epsilon_mse = epsilon_error.pow(2).mean()
 
@@ -203,40 +187,62 @@ def evaluate_sigma(
         )
     )
 
-    # ------------------------------------------------------------
-    # Convert epsilon prediction to score.
+    # ---------------------------------------------------------
+    # Convert epsilon prediction to score
     #
     # epsilon_theta ~= -epsilon
     #
     # score_theta = epsilon_theta / sigma
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------
 
     predicted_score = (
         epsilon_pred
         / sigma_tensor[:, None, None, None]
     )
 
-    # ------------------------------------------------------------
-    # Analytical marginal score.
-    #
-    # Var(H_sigma) = Var(H0) + sigma^2
-    #
-    # score* = -H_sigma / (Var(H0) + sigma^2)
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------
+    # Analytical score
+    # ---------------------------------------------------------
 
-    total_variance = (
-        channel_variance
-        + sigma * sigma
-    )
+    if H_prev is None:
+        # Marginal score:
+        #
+        # H_sigma ~ N(0, v + sigma^2)
 
-    true_score = (
-        -H_sigma
-        / total_variance
-    )
+        total_variance = (
+            channel_variance
+            + sigma * sigma
+        )
 
-    # ------------------------------------------------------------
-    # Analytical score error.
-    # ------------------------------------------------------------
+        true_score = (
+            -H_sigma
+            / total_variance
+        )
+
+    else:
+        # Temporal conditional score:
+        #
+        # H_t | H_{t-1}
+        # ~ N(alpha H_{t-1}, (1-alpha^2)v)
+        #
+        # After adding sigma noise:
+        #
+        # variance = (1-alpha^2)v + sigma^2
+
+        conditional_variance = (
+            (1.0 - alpha * alpha)
+            * channel_variance
+            + sigma * sigma
+        )
+
+        true_score = (
+            -(H_sigma - alpha * H_prev)
+            / conditional_variance
+        )
+
+    # ---------------------------------------------------------
+    # Score metrics
+    # ---------------------------------------------------------
 
     score_error = (
         predicted_score - true_score
@@ -251,10 +257,6 @@ def evaluate_sigma(
             + 1e-12
         )
     )
-
-    # ------------------------------------------------------------
-    # Cosine similarity.
-    # ------------------------------------------------------------
 
     pred_flat = predicted_score.reshape(
         batch_size,
@@ -271,10 +273,6 @@ def evaluate_sigma(
         true_flat,
         dim=1,
     ).mean()
-
-    # ------------------------------------------------------------
-    # Score magnitude.
-    # ------------------------------------------------------------
 
     predicted_score_rms = (
         predicted_score.pow(2).mean().sqrt()
@@ -295,20 +293,70 @@ def evaluate_sigma(
     }
 
 
+@torch.no_grad()
+def estimate_temporal_channel_variance(
+    eval_samples: int,
+    eval_batch_size: int,
+    Nu: int,
+    Nr: int,
+    Nt: int,
+    K: int,
+    sequence_length: int,
+    alpha: float,
+) -> float:
+    """
+    Estimate marginal real/imag component variance from AR(1) sequences.
+    """
+
+    device = torch.device("cpu")
+
+    estimate_samples = min(
+        eval_samples,
+        max(eval_batch_size, 1000),
+    )
+
+    H_seq = generate_rayleigh_channel_sequence(
+        estimate_samples,
+        Nu,
+        Nr,
+        Nt,
+        K,
+        sequence_length,
+        alpha,
+        device,
+    )
+
+    # First user only.
+    #
+    # Shape:
+    #   (B, T, Nr*K, Nt*K)
+    H_seq = H_seq[:, :, 0]
+
+    real_var = H_seq.real.var(unbiased=False)
+    imag_var = H_seq.imag.var(unbiased=False)
+
+    variance = 0.5 * (
+        real_var + imag_var
+    )
+
+    return variance.item()
+
+
 def evaluate(
     cfg: dict,
     checkpoint_path: str,
+    temporal_data: bool = False,
+    alpha: float = 0.7,
+    sequence_length: int = 20,
 ):
     device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
     )
 
     print(f"Device: {device}")
     print(f"Checkpoint: {checkpoint_path}")
-
-    # ------------------------------------------------------------
-    # Channel configuration
-    # ------------------------------------------------------------
 
     Nr = cfg.get("Nr", 4)
     Nt = cfg.get("Nt", 1)
@@ -335,12 +383,24 @@ def evaluate(
         10000,
     )
 
-    # IMPORTANT:
-    # Evaluation is performed in small GPU batches to avoid OOM.
     eval_batch_size = cfg.get(
         "channel_eval_batch_size",
         128,
     )
+
+    if temporal_data:
+        alpha = float(alpha)
+        sequence_length = int(sequence_length)
+
+        if not 0 <= alpha < 1:
+            raise ValueError(
+                f"alpha must satisfy 0 <= alpha < 1, got {alpha}"
+            )
+
+        if sequence_length < 2:
+            raise ValueError(
+                "sequence_length must be >= 2"
+            )
 
     print(
         f"Channel dimensions: "
@@ -364,9 +424,37 @@ def evaluate(
         f"Evaluation batch size: {eval_batch_size}"
     )
 
-    # ------------------------------------------------------------
-    # Build model.
-    # ------------------------------------------------------------
+    if temporal_data:
+        print()
+        print("Mode: TEMPORAL DATA")
+        print(f"AR(1) alpha: {alpha}")
+        print(
+            f"Sequence length: {sequence_length}"
+        )
+        print(
+            f"Temporal pairs: "
+            f"{eval_samples * (sequence_length - 1)}"
+        )
+        print(
+            "Model input: H_sigma / sigma, sigma"
+        )
+        print(
+            "H_prev is NOT given to the model."
+        )
+        print(
+            "H_prev is used only for the conditional analytical target."
+        )
+
+    else:
+        print()
+        print("Mode: NON-TEMPORAL")
+        print(
+            "Analytical target: marginal Gaussian score"
+        )
+
+    # ---------------------------------------------------------
+    # Build OLD non-temporal model
+    # ---------------------------------------------------------
 
     net = ChannelScoreNet(
         Nr=Nr,
@@ -397,10 +485,6 @@ def evaluate(
         f"{num_parameters:,}"
     )
 
-    # ------------------------------------------------------------
-    # Load checkpoint.
-    # ------------------------------------------------------------
-
     load_checkpoint(
         net,
         checkpoint_path,
@@ -411,44 +495,55 @@ def evaluate(
 
     print("Checkpoint loaded successfully.")
 
-    # ------------------------------------------------------------
-    # Generate clean channels in manageable batches.
-    #
-    # We keep the complete H0 dataset on CPU and only move one
-    # evaluation batch to GPU at a time.
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------
+    # Estimate variance
+    # ---------------------------------------------------------
 
-    H0_complex = generate_rayleigh_channel(
-        eval_samples,
-        Nu,
-        Nr,
-        Nt,
-        K,
-        torch.device("cpu"),
-    )
-    
-    H0_complex = H0_complex[:, 0]
-    
-    H0_full = torch.stack(
-        [
-            H0_complex.real,
-            H0_complex.imag,
-        ],
-        dim=1,
-    )
+    if temporal_data:
+        channel_variance = (
+            estimate_temporal_channel_variance(
+                eval_samples,
+                eval_batch_size,
+                Nu,
+                Nr,
+                Nt,
+                K,
+                sequence_length,
+                alpha,
+            )
+        )
 
-    print(
-        f"H0 shape: {tuple(H0_full.shape)}"
-    )
+        H0_full = None
 
-    # ------------------------------------------------------------
-    # Determine actual channel normalization from the full
-    # evaluation dataset on CPU.
-    # ------------------------------------------------------------
+    else:
+        H0_complex = generate_rayleigh_channel(
+            eval_samples,
+            Nu,
+            Nr,
+            Nt,
+            K,
+            torch.device("cpu"),
+        )
 
-    channel_variance = estimate_channel_variance(
-        H0_full
-    )
+        H0_complex = H0_complex[:, 0]
+
+        H0_full = torch.stack(
+            [
+                H0_complex.real,
+                H0_complex.imag,
+            ],
+            dim=1,
+        )
+
+        print(
+            f"H0 shape: {tuple(H0_full.shape)}"
+        )
+
+        channel_variance = (
+            estimate_channel_variance(
+                H0_full
+            )
+        )
 
     print(
         f"Estimated real/imag variance: "
@@ -460,10 +555,6 @@ def evaluate(
         f"{math.sqrt(channel_variance):.8f}"
     )
 
-    # ------------------------------------------------------------
-    # Sigma schedule.
-    # ------------------------------------------------------------
-
     sigmas = build_sigma_schedule(
         sigma_min,
         sigma_max,
@@ -471,26 +562,21 @@ def evaluate(
         device,
     )
 
-    # ------------------------------------------------------------
-    # Evaluate every sigma.
-    # ------------------------------------------------------------
-
     results = []
 
     print()
     print(
         "sigma        "
         "eps_MSE       "
-        "score_MSE     "
-        "score_rel     "
+        "score_MSE       "
+        "score_rel       "
         "cosine"
     )
-    print("-" * 75)
+    print("-" * 80)
 
     for sigma_tensor in sigmas:
         sigma = sigma_tensor.item()
 
-        # Accumulators for this sigma.
         total_epsilon_mse = 0.0
         total_score_mse = 0.0
         total_epsilon_relative = 0.0
@@ -499,99 +585,261 @@ def evaluate(
         total_predicted_score_rms = 0.0
         total_true_score_rms = 0.0
 
-        num_batches = 0
+        total_examples = 0
 
-        # --------------------------------------------------------
-        # Process clean channels in GPU batches.
-        # --------------------------------------------------------
+        # =====================================================
+        # NORMAL I.I.D. DATA
+        # =====================================================
 
-        for start in range(
-            0,
-            eval_samples,
-            eval_batch_size,
-        ):
-            end = min(
-                start + eval_batch_size,
+        if not temporal_data:
+
+            for start in range(
+                0,
                 eval_samples,
-            )
+                eval_batch_size,
+            ):
+                end = min(
+                    start + eval_batch_size,
+                    eval_samples,
+                )
 
-            H0_batch = H0_full[
-                start:end
-            ].to(device)
+                H0_batch = (
+                    H0_full[start:end]
+                    .to(device)
+                )
 
-            batch_result = evaluate_sigma(
-                net,
-                H0_batch,
-                sigma,
-                channel_variance,
-            )
+                batch_size = (
+                    H0_batch.shape[0]
+                )
 
-            total_epsilon_mse += (
-                batch_result["epsilon_mse"]
-            )
+                batch_result = evaluate_sigma(
+                    net,
+                    H0_batch,
+                    sigma,
+                    channel_variance,
+                )
 
-            total_epsilon_relative += (
-                batch_result["epsilon_relative"]
-            )
+                total_epsilon_mse += (
+                    batch_result["epsilon_mse"]
+                    * batch_size
+                )
 
-            total_score_mse += (
-                batch_result["score_mse"]
-            )
+                total_epsilon_relative += (
+                    batch_result[
+                        "epsilon_relative"
+                    ]
+                    * batch_size
+                )
 
-            total_score_relative += (
-                batch_result["score_relative"]
-            )
+                total_score_mse += (
+                    batch_result["score_mse"]
+                    * batch_size
+                )
 
-            total_cosine += (
-                batch_result["score_cosine"]
-            )
+                total_score_relative += (
+                    batch_result[
+                        "score_relative"
+                    ]
+                    * batch_size
+                )
 
-            total_predicted_score_rms += (
-                batch_result["predicted_score_rms"]
-            )
+                total_cosine += (
+                    batch_result[
+                        "score_cosine"
+                    ]
+                    * batch_size
+                )
 
-            total_true_score_rms += (
-                batch_result["true_score_rms"]
-            )
+                total_predicted_score_rms += (
+                    batch_result[
+                        "predicted_score_rms"
+                    ]
+                    * batch_size
+                )
 
-            num_batches += 1
+                total_true_score_rms += (
+                    batch_result[
+                        "true_score_rms"
+                    ]
+                    * batch_size
+                )
 
-            # Release GPU tensors before processing the next batch.
-            del H0_batch
+                total_examples += batch_size
 
-        # --------------------------------------------------------
-        # Average batch metrics.
-        # --------------------------------------------------------
+        # =====================================================
+        # TEMPORAL AR(1) DATA
+        # =====================================================
+
+        else:
+
+            for start in range(
+                0,
+                eval_samples,
+                eval_batch_size,
+            ):
+                end = min(
+                    start + eval_batch_size,
+                    eval_samples,
+                )
+
+                sequence_batch_size = (
+                    end - start
+                )
+
+                H_seq = (
+                    generate_rayleigh_channel_sequence(
+                        sequence_batch_size,
+                        Nu,
+                        Nr,
+                        Nt,
+                        K,
+                        sequence_length,
+                        alpha,
+                        torch.device("cpu"),
+                    )
+                )
+
+                # Select first user.
+                #
+                # (B, T, Nr*K, Nt*K)
+                H_seq = H_seq[:, :, 0]
+
+                H_prev_complex = (
+                    H_seq[:, :-1]
+                )
+
+                H_curr_complex = (
+                    H_seq[:, 1:]
+                )
+
+                num_pairs = (
+                    sequence_batch_size
+                    * (sequence_length - 1)
+                )
+
+                H_prev_complex = (
+                    H_prev_complex.reshape(
+                        num_pairs,
+                        Nr * K,
+                        Nt * K,
+                    )
+                )
+
+                H_curr_complex = (
+                    H_curr_complex.reshape(
+                        num_pairs,
+                        Nr * K,
+                        Nt * K,
+                    )
+                )
+
+                H_prev = torch.stack(
+                    [
+                        H_prev_complex.real,
+                        H_prev_complex.imag,
+                    ],
+                    dim=1,
+                ).to(device)
+
+                H_curr = torch.stack(
+                    [
+                        H_curr_complex.real,
+                        H_curr_complex.imag,
+                    ],
+                    dim=1,
+                ).to(device)
+
+                batch_result = evaluate_sigma(
+                    net,
+                    H_curr,
+                    sigma,
+                    channel_variance,
+                    H_prev=H_prev,
+                    alpha=alpha,
+                )
+
+                total_epsilon_mse += (
+                    batch_result["epsilon_mse"]
+                    * num_pairs
+                )
+
+                total_epsilon_relative += (
+                    batch_result[
+                        "epsilon_relative"
+                    ]
+                    * num_pairs
+                )
+
+                total_score_mse += (
+                    batch_result["score_mse"]
+                    * num_pairs
+                )
+
+                total_score_relative += (
+                    batch_result[
+                        "score_relative"
+                    ]
+                    * num_pairs
+                )
+
+                total_cosine += (
+                    batch_result[
+                        "score_cosine"
+                    ]
+                    * num_pairs
+                )
+
+                total_predicted_score_rms += (
+                    batch_result[
+                        "predicted_score_rms"
+                    ]
+                    * num_pairs
+                )
+
+                total_true_score_rms += (
+                    batch_result[
+                        "true_score_rms"
+                    ]
+                    * num_pairs
+                )
+
+                total_examples += num_pairs
+
+                del H_seq
+                del H_prev_complex
+                del H_curr_complex
+                del H_prev
+                del H_curr
 
         result = {
             "sigma": sigma,
             "epsilon_mse": (
                 total_epsilon_mse
-                / num_batches
+                / total_examples
             ),
             "epsilon_relative": (
                 total_epsilon_relative
-                / num_batches
+                / total_examples
             ),
             "score_mse": (
                 total_score_mse
-                / num_batches
+                / total_examples
             ),
             "score_relative": (
                 total_score_relative
-                / num_batches
+                / total_examples
             ),
             "score_cosine": (
                 total_cosine
-                / num_batches
+                / total_examples
             ),
             "predicted_score_rms": (
                 total_predicted_score_rms
-                / num_batches
+                / total_examples
             ),
             "true_score_rms": (
                 total_true_score_rms
-                / num_batches
+                / total_examples
             ),
         }
 
@@ -600,14 +848,10 @@ def evaluate(
         print(
             f"{result['sigma']:8.4f}    "
             f"{result['epsilon_mse']:10.6f}    "
-            f"{result['score_mse']:10.6f}    "
+            f"{result['score_mse']:12.6f}    "
             f"{result['score_relative']:10.6f}    "
             f"{result['score_cosine']:8.5f}"
         )
-
-    # ------------------------------------------------------------
-    # Aggregate metrics across sigmas.
-    # ------------------------------------------------------------
 
     mean_epsilon_mse = sum(
         r["epsilon_mse"]
@@ -634,14 +878,48 @@ def evaluate(
         for r in results
     ) / len(results)
 
-    # ------------------------------------------------------------
-    # Print summary.
-    # ------------------------------------------------------------
+    mean_predicted_score_rms = sum(
+        r["predicted_score_rms"]
+        for r in results
+    ) / len(results)
+
+    mean_true_score_rms = sum(
+        r["true_score_rms"]
+        for r in results
+    ) / len(results)
 
     print()
-    print("=" * 75)
+    print("=" * 80)
     print("SUMMARY")
-    print("=" * 75)
+    print("=" * 80)
+
+    if temporal_data:
+        print("Mode: TEMPORAL DATA")
+        print(
+            f"AR(1) alpha: {alpha:.6f}"
+        )
+        print(
+            f"Sequence length: "
+            f"{sequence_length}"
+        )
+        print(
+            f"Temporal pairs: "
+            f"{eval_samples * (sequence_length - 1)}"
+        )
+        print(
+            "Model: NON-TEMPORAL ChannelScoreNet"
+        )
+        print(
+            "Target: conditional score "
+            "p(H_sigma | H_prev)"
+        )
+    else:
+        print("Mode: NON-TEMPORAL")
+        print(
+            "Target: marginal score p(H_sigma)"
+        )
+
+    print()
 
     print(
         f"Mean epsilon MSE: "
@@ -669,24 +947,44 @@ def evaluate(
     )
 
     print(
+        f"Mean predicted score RMS: "
+        f"{mean_predicted_score_rms:.8f}"
+    )
+
+    print(
+        f"Mean true score RMS: "
+        f"{mean_true_score_rms:.8f}"
+    )
+
+    print(
         f"Channel component variance: "
         f"{channel_variance:.8f}"
     )
 
-    print("=" * 75)
+    print("=" * 80)
 
-    # ------------------------------------------------------------
-    # Save results.
-    # ------------------------------------------------------------
+    if temporal_data:
+        default_output = (
+            "channel_score_temporal_data_evaluation.json"
+        )
+    else:
+        default_output = (
+            "channel_score_evaluation.json"
+        )
 
     output_path = cfg.get(
         "channel_eval_output",
-        "channel_score_evaluation.json",
+        default_output,
     )
 
     output = {
         "checkpoint": checkpoint_path,
         "device": str(device),
+        "mode": (
+            "temporal_data"
+            if temporal_data
+            else "non_temporal"
+        ),
         "channel": {
             "Nr": Nr,
             "Nt": Nt,
@@ -699,14 +997,57 @@ def evaluate(
             "sigma_min": sigma_min,
             "sigma_max": sigma_max,
             "num_sigmas": num_sigmas,
-            "channel_component_variance": channel_variance,
+            "channel_component_variance": (
+                channel_variance
+            ),
+        },
+        "temporal": {
+            "enabled": temporal_data,
+            "alpha": (
+                alpha
+                if temporal_data
+                else None
+            ),
+            "sequence_length": (
+                sequence_length
+                if temporal_data
+                else None
+            ),
+            "temporal_pairs": (
+                eval_samples
+                * (sequence_length - 1)
+                if temporal_data
+                else None
+            ),
+            "target": (
+                "conditional_score_p(H_sigma | H_prev)"
+                if temporal_data
+                else "marginal_score_p(H_sigma)"
+            ),
+            "model_receives_H_prev": False,
         },
         "summary": {
-            "mean_epsilon_mse": mean_epsilon_mse,
-            "mean_epsilon_relative": mean_epsilon_relative,
-            "mean_score_mse": mean_score_mse,
-            "mean_score_relative": mean_score_relative,
-            "mean_score_cosine": mean_score_cosine,
+            "mean_epsilon_mse": (
+                mean_epsilon_mse
+            ),
+            "mean_epsilon_relative": (
+                mean_epsilon_relative
+            ),
+            "mean_score_mse": (
+                mean_score_mse
+            ),
+            "mean_score_relative": (
+                mean_score_relative
+            ),
+            "mean_score_cosine": (
+                mean_score_cosine
+            ),
+            "mean_predicted_score_rms": (
+                mean_predicted_score_rms
+            ),
+            "mean_true_score_rms": (
+                mean_true_score_rms
+            ),
         },
         "per_sigma": results,
     }
@@ -738,14 +1079,62 @@ def main():
         required=True,
     )
 
+    parser.add_argument(
+        "--temporal-data",
+        action="store_true",
+        help=(
+            "Evaluate the non-temporal checkpoint "
+            "on AR(1) temporal channel data."
+        ),
+    )
+
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help=(
+            "AR(1) correlation coefficient. "
+            "Overrides YAML channel_ar1_alpha."
+        ),
+    )
+
+    parser.add_argument(
+        "--sequence-length",
+        type=int,
+        default=None,
+        help=(
+            "AR(1) sequence length. "
+            "Overrides YAML channel_sequence_length."
+        ),
+    )
+
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
+    if args.alpha is not None:
+        alpha = args.alpha
+    else:
+        alpha = cfg.get(
+            "channel_ar1_alpha",
+            cfg.get("alpha", 0.7),
+        )
+
+    if args.sequence_length is not None:
+        sequence_length = args.sequence_length
+    else:
+        sequence_length = cfg.get(
+            "channel_sequence_length",
+            20,
+        )
+
     evaluate(
         cfg,
         args.checkpoint,
+        temporal_data=args.temporal_data,
+        alpha=alpha,
+        sequence_length=sequence_length,
     )
 
 
