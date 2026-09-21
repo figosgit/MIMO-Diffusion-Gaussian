@@ -1,23 +1,35 @@
 """
-Train channel score network q_{theta_H}.
+Train channel score network using a Gaussian VE-SDE.
 
-The network uses an epsilon parameterization. Given
+Forward SDE:
+    dH = g(t) dW
 
-    H_j = H_0 + sigma_j * epsilon,
+with geometric noise schedule
 
-it learns
+    sigma(t) = sigma_min * (sigma_max / sigma_min)^t,
+    t ~ Uniform(0, 1).
 
-    epsilon_theta(H_j, sigma_j) ~= -epsilon.
+Its transition distribution is
 
-The corresponding conditional score is
+    H_t | H_0 ~ N(H_0, sigma(t)^2 I),
 
-    s_theta(H_j, sigma_j)
-        = epsilon_theta(H_j, sigma_j) / sigma_j.
+so we sample directly as
 
-H_0 is drawn from the i.i.d. Rayleigh channel prior.
+    H_t = H_0 + sigma(t) * epsilon.
+
+The network directly predicts the score
+
+    s_theta(H_t, t) ~= -epsilon / sigma(t).
+
+VE score-matching loss:
+
+    L = E[
+        sigma(t)^2 *
+        ||s_theta(H_t,t) + epsilon/sigma(t)||^2
+    ].
 
 Usage:
-    python -m score_networks.train_channel_score \
+    python -m score_networks.train_channel_score_ve_sde \
         --config configs/runpod_minimal.yaml
 """
 
@@ -41,8 +53,11 @@ from .ncsnpp import ChannelScoreNet
 from channels.rayleigh import generate_rayleigh_channel
 
 
+# ================================================================
+# Logging
+# ================================================================
+
 def setup_logging(log_dir: str, run_name: str):
-    """Set up file + console logging and initialize the CSV metrics file."""
     os.makedirs(log_dir, exist_ok=True)
 
     log_path = os.path.join(log_dir, f"{run_name}.log")
@@ -54,18 +69,23 @@ def setup_logging(log_dir: str, run_name: str):
 
     file_handler = logging.FileHandler(log_path)
     file_handler.setFormatter(
-        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(message)s"
+        )
     )
     logger.addHandler(file_handler)
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(
-        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(message)s"
+        )
     )
     logger.addHandler(console_handler)
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
+
         writer.writerow([
             "epoch",
             "avg_loss",
@@ -78,166 +98,259 @@ def setup_logging(log_dir: str, run_name: str):
     return logger, csv_path, log_path
 
 
-def sample_log_sigma(
-    batch_size: int,
+# ================================================================
+# VE-SDE schedule
+# ================================================================
+
+def ve_sigma(
+    t: torch.Tensor,
     sigma_min: float,
     sigma_max: float,
+):
+    """
+    Geometric VE noise schedule.
+
+        sigma(t)
+            = sigma_min
+              * (sigma_max / sigma_min)^t
+
+    t = 0  -> sigma_min
+    t = 1  -> sigma_max
+    """
+
+    ratio = sigma_max / sigma_min
+
+    return sigma_min * ratio ** t
+
+
+def sample_time(
+    batch_size: int,
     device: torch.device,
 ):
     """
-    Sample sigma continuously and uniformly in log-space.
+    Continuous SDE time:
 
-    This gives equal probability to each order of magnitude instead of
-    over/under-representing particular noise scales.
+        t ~ Uniform(0, 1)
     """
-    log_sigma_min = math.log(sigma_min)
-    log_sigma_max = math.log(sigma_max)
 
-    log_sigma = (
-        torch.rand(batch_size, device=device)
-        * (log_sigma_max - log_sigma_min)
-        + log_sigma_min
+    return torch.rand(
+        batch_size,
+        device=device,
     )
 
-    return log_sigma.exp()
 
+# ================================================================
+# VE-SDE score-matching loss
+# ================================================================
 
-def epsilon_dsm_loss(
+def ve_sde_dsm_loss(
     net: nn.Module,
     H0: torch.Tensor,
     sigma_min: float,
     sigma_max: float,
 ):
     """
-    Epsilon-parameterized denoising score matching.
+    Gaussian VE-SDE denoising score matching.
 
-    H_j = H_0 + sigma * epsilon
+    Forward marginal:
 
-    Target:
-        epsilon_target = -epsilon
+        H_t = H_0 + sigma(t) * epsilon
+
+    epsilon ~ N(0, I)
+
+    Conditional score:
+
+        grad log p(H_t | H_0)
+            = -epsilon / sigma(t)
 
     Network:
-        epsilon_pred = net(H_j, sigma)
+
+        score_pred
+            = s_theta(H_t, t)
 
     Loss:
-        E[ ||epsilon_pred + epsilon||^2 ]
 
-    The sigma^2 weighting used in the old implementation is intentionally
-    removed because the network output is now epsilon-parameterized rather
-    than direct-score-parameterized.
+        sigma(t)^2
+        * ||score_pred - score_target||^2
     """
+
     batch_size = H0.shape[0]
     device = H0.device
 
-    sigma = torch.ones(
-    batch_size,
-    device=device,
-)
+    # ------------------------------------------------------------
+    # Sample continuous SDE time
+    # ------------------------------------------------------------
 
-    eps_real = torch.randn_like(H0.real)
-    eps_imag = torch.randn_like(H0.imag)
+    t = sample_time(
+        batch_size,
+        device,
+    )
+
+    # ------------------------------------------------------------
+    # Convert time -> VE noise scale
+    # ------------------------------------------------------------
+
+    sigma = ve_sigma(
+        t,
+        sigma_min,
+        sigma_max,
+    )
 
     sigma_3d = sigma[:, None, None]
+    sigma_4d = sigma[:, None, None, None]
 
     # ------------------------------------------------------------
-    # Perturb the channel
-    #
-    # H_j = H_0 + sigma * epsilon
+    # Gaussian Brownian perturbation
     # ------------------------------------------------------------
 
-    H_j_real = H0.real + sigma_3d * eps_real
-    H_j_imag = H0.imag + sigma_3d * eps_imag
+    eps_real = torch.randn_like(
+        H0.real
+    )
 
-    H_j = torch.stack(
-        [H_j_real, H_j_imag],
+    eps_imag = torch.randn_like(
+        H0.imag
+    )
+
+    H_t_real = (
+        H0.real
+        + sigma_3d * eps_real
+    )
+
+    H_t_imag = (
+        H0.imag
+        + sigma_3d * eps_imag
+    )
+
+    H_t = torch.stack(
+        [
+            H_t_real,
+            H_t_imag,
+        ],
         dim=1,
     )
 
     # ------------------------------------------------------------
-    # Network input
+    # Same normalization convention as our other experiments.
     #
-    # Keep the same normalization convention currently used by
-    # ChannelScoreNet.
+    # The physical SDE state is H_t.
+    # We normalize only the NN input.
     # ------------------------------------------------------------
 
-    H_j_norm = H_j / sigma[:, None, None, None]
+    H_t_norm = (
+        H_t
+        / sigma_4d
+    )
 
     # ------------------------------------------------------------
-    # Epsilon target
+    # Exact Gaussian conditional score
     #
-    # score = -epsilon / sigma
-    #
-    # network output = -epsilon
+    # grad log p(H_t | H_0)
+    #     = -(H_t - H_0) / sigma^2
+    #     = -epsilon / sigma
     # ------------------------------------------------------------
 
-    epsilon_target = torch.stack(
-        [-eps_real, -eps_imag],
+    score_target = torch.stack(
+        [
+            -eps_real / sigma_3d,
+            -eps_imag / sigma_3d,
+        ],
         dim=1,
     )
 
-    epsilon_pred = net(
-        H_j_norm,
+    # ------------------------------------------------------------
+    # Network predicts SCORE directly.
+    #
+    # ChannelScoreNet currently expects its second argument
+    # to be the noise level, so pass sigma(t).
+    # ------------------------------------------------------------
+
+    score_pred = net(
+        H_t_norm,
         sigma,
     )
 
     # ------------------------------------------------------------
-    # Unweighted epsilon loss
+    # VE likelihood / score weighting
+    #
+    # lambda(t) = sigma(t)^2
     # ------------------------------------------------------------
 
     loss = (
-        epsilon_pred - epsilon_target
-    ).pow(2).mean()
+        sigma_4d.pow(2)
+        * (
+            score_pred
+            - score_target
+        ).pow(2)
+    ).mean()
 
     return loss
 
 
-def train(cfg: dict, config_path: str = ""):
+# ================================================================
+# Training
+# ================================================================
+
+def train(
+    cfg: dict,
+    config_path: str = "",
+):
+
     device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
     )
 
     # ============================================================
     # Logging
     # ============================================================
 
-    log_dir = cfg.get("log_dir", "logs")
+    log_dir = cfg.get(
+        "log_dir",
+        "logs",
+    )
 
-    run_name = (
+    base_run_name = (
         cfg.get("run_name")
-        or os.path.splitext(os.path.basename(config_path))[0]
+        or os.path.splitext(
+            os.path.basename(config_path)
+        )[0]
         or "run"
     )
 
     run_name = (
-        f"{run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        f"{base_run_name}_ve_sde_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
 
-    logger, csv_path, log_path = setup_logging(
-        log_dir,
-        run_name,
+    logger, csv_path, log_path = (
+        setup_logging(
+            log_dir,
+            run_name,
+        )
     )
 
-    logger.info(f"Starting run: {run_name}")
-    logger.info(f"Device: {device}")
     logger.info(
-        f"Config: {json.dumps(cfg, indent=2, default=str)}"
+        f"Starting VE-SDE run: {run_name}"
+    )
+
+    logger.info(
+        f"Device: {device}"
+    )
+
+    logger.info(
+        f"Config: "
+        f"{json.dumps(cfg, indent=2, default=str)}"
     )
 
     # ============================================================
-    # Channel configuration
+    # Channel
     # ============================================================
 
     Nr = cfg.get("Nr", 4)
     Nt = cfg.get("Nt", 1)
     K = cfg.get("K", 192)
     Nu = cfg.get("Nu", 1)
-
-    # IMPORTANT:
-    # channel_J is independent from the PVD J.
-    channel_J = cfg.get(
-        "channel_J",
-        cfg.get("J", 50),
-    )
 
     sigma_min = cfg.get(
         "sigma_H_1",
@@ -251,25 +364,30 @@ def train(cfg: dict, config_path: str = ""):
 
     if sigma_min <= 0:
         raise ValueError(
-            f"sigma_H_1 must be > 0, got {sigma_min}"
+            "sigma_min must be > 0"
         )
 
     if sigma_max <= sigma_min:
         raise ValueError(
-            f"sigma_H_J must be > sigma_H_1, "
-            f"got {sigma_min} -> {sigma_max}"
+            "sigma_max must be > sigma_min"
         )
 
     logger.info(
-        f"Channel dimensions: Nr={Nr}, Nt={Nt}, K={K}, Nu={Nu}"
+        f"Channel dimensions: "
+        f"Nr={Nr}, Nt={Nt}, K={K}, Nu={Nu}"
     )
 
     logger.info(
-        f"Sigma range: [{sigma_min}, {sigma_max}]"
+        f"VE sigma range: "
+        f"[{sigma_min}, {sigma_max}]"
     )
 
     logger.info(
-        f"Continuous log-sigma sampling enabled"
+        "SDE time: t ~ Uniform(0,1)"
+    )
+
+    logger.info(
+        "Parameterization: DIRECT SCORE"
     )
 
     # ============================================================
@@ -280,18 +398,22 @@ def train(cfg: dict, config_path: str = ""):
         Nr=Nr,
         Nt=Nt,
         K=K,
+
         hidden_dim=cfg.get(
             "channel_hidden_dim",
             1024,
         ),
+
         num_layers=cfg.get(
             "channel_num_layers",
             8,
         ),
+
         time_dim=cfg.get(
             "channel_time_dim",
             512,
         ),
+
     ).to(device)
 
     num_parameters = sum(
@@ -301,7 +423,8 @@ def train(cfg: dict, config_path: str = ""):
     )
 
     logger.info(
-        f"Trainable parameters: {num_parameters:,}"
+        f"Trainable parameters: "
+        f"{num_parameters:,}"
     )
 
     # ============================================================
@@ -315,7 +438,9 @@ def train(cfg: dict, config_path: str = ""):
 
     optimizer = optim.AdamW(
         net.parameters(),
+
         lr=learning_rate,
+
         weight_decay=cfg.get(
             "score_weight_decay",
             1e-4,
@@ -327,19 +452,19 @@ def train(cfg: dict, config_path: str = ""):
         500,
     )
 
-    min_learning_rate = cfg.get(
-        "score_lr_min",
-        1e-5,
-    )
-
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=epochs,
-        eta_min=min_learning_rate,
+    scheduler = (
+        optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=epochs,
+            eta_min=cfg.get(
+                "score_lr_min",
+                1e-5,
+            ),
+        )
     )
 
     # ============================================================
-    # Training configuration
+    # Dataset
     # ============================================================
 
     batch_size = cfg.get(
@@ -371,19 +496,20 @@ def train(cfg: dict, config_path: str = ""):
 
     best_checkpoint = os.path.join(
         ckpt_dir,
-        "channel_score_best.pt",
+        "channel_score_ve_sde_best.pt",
     )
 
     final_checkpoint = os.path.join(
         ckpt_dir,
-        "channel_score_final.pt",
+        "channel_score_ve_sde_final.pt",
     )
 
     # ============================================================
-    # Training state
+    # State
     # ============================================================
 
     best_loss = float("inf")
+
     history = []
 
     run_start = time.time()
@@ -397,26 +523,24 @@ def train(cfg: dict, config_path: str = ""):
     )
 
     logger.info(
-        f"Samples per epoch: {samples_per_epoch}"
-    )
-
-    logger.info(
-        f"Steps per epoch: "
-        f"{math.ceil(samples_per_epoch / batch_size)}"
+        f"Samples per epoch: "
+        f"{samples_per_epoch}"
     )
 
     # ============================================================
-    # Training
+    # Training loop
     # ============================================================
 
     try:
+
         for epoch in range(epochs):
+
             epoch_start = time.time()
 
             net.train()
 
             # ----------------------------------------------------
-            # Generate fresh Rayleigh channels.
+            # Fresh channel samples
             # ----------------------------------------------------
 
             H0 = generate_rayleigh_channel(
@@ -428,19 +552,15 @@ def train(cfg: dict, config_path: str = ""):
                 device,
             )
 
-            # Select the first user.
-            #
-            # Shape:
-            #   (B, Nr*K, Nt*K)
-            #
             H0 = H0[:, 0]
 
-            dataset = TensorDataset(H0)
-
             loader = DataLoader(
-                dataset,
+                TensorDataset(H0),
+
                 batch_size=batch_size,
+
                 shuffle=True,
+
                 drop_last=False,
             )
 
@@ -448,7 +568,8 @@ def train(cfg: dict, config_path: str = ""):
             num_steps = 0
 
             for (H0_batch,) in loader:
-                loss = epsilon_dsm_loss(
+
+                loss = ve_sde_dsm_loss(
                     net,
                     H0_batch,
                     sigma_min,
@@ -475,16 +596,16 @@ def train(cfg: dict, config_path: str = ""):
 
             avg_loss = (
                 total_loss / num_steps
-                if num_steps > 0
-                else float("inf")
             )
 
             epoch_time = (
-                time.time() - epoch_start
+                time.time()
+                - epoch_start
             )
 
             current_lr = (
-                optimizer.param_groups[0]["lr"]
+                optimizer
+                .param_groups[0]["lr"]
             )
 
             # ----------------------------------------------------
@@ -492,6 +613,7 @@ def train(cfg: dict, config_path: str = ""):
             # ----------------------------------------------------
 
             if avg_loss < best_loss:
+
                 best_loss = avg_loss
 
                 torch.save(
@@ -511,7 +633,9 @@ def train(cfg: dict, config_path: str = ""):
                 "best_loss_so_far": best_loss,
             }
 
-            history.append(history_entry)
+            history.append(
+                history_entry
+            )
 
             # ----------------------------------------------------
             # CSV
@@ -522,6 +646,7 @@ def train(cfg: dict, config_path: str = ""):
                 "a",
                 newline="",
             ) as f:
+
                 writer = csv.writer(f)
 
                 writer.writerow([
@@ -532,10 +657,6 @@ def train(cfg: dict, config_path: str = ""):
                     f"{best_loss:.6f}",
                     datetime.now().isoformat(),
                 ])
-
-            # ----------------------------------------------------
-            # Logging
-            # ----------------------------------------------------
 
             logger.info(
                 f"Epoch {epoch + 1}/{epochs} | "
@@ -555,11 +676,12 @@ def train(cfg: dict, config_path: str = ""):
         )
 
         total_time = (
-            time.time() - run_start
+            time.time()
+            - run_start
         )
 
         logger.info(
-            f"Channel score network training complete. "
+            "VE-SDE score training complete. "
             f"Total time: {total_time:.2f}s"
         )
 
@@ -568,20 +690,50 @@ def train(cfg: dict, config_path: str = ""):
         # ========================================================
 
         summary = {
+
             "run_name": run_name,
+
             "status": "completed",
+
+            "model": "Gaussian VE-SDE",
+
+            "parameterization":
+                "direct_score",
+
+            "score_target":
+                "-epsilon / sigma(t)",
+
+            "time_sampling":
+                "Uniform(0,1)",
+
+            "sigma_schedule":
+                "geometric",
+
+            "loss_weighting":
+                "sigma(t)^2",
+
             "config": cfg,
+
             "total_epochs": epochs,
+
             "total_time_sec": total_time,
+
             "best_loss": best_loss,
+
             "final_loss": (
                 history[-1]["avg_loss"]
                 if history
                 else None
             ),
+
             "device": str(device),
-            "checkpoint_best": best_checkpoint,
-            "checkpoint_final": final_checkpoint,
+
+            "checkpoint_best":
+                best_checkpoint,
+
+            "checkpoint_final":
+                final_checkpoint,
+
             "history": history,
         }
 
@@ -590,7 +742,11 @@ def train(cfg: dict, config_path: str = ""):
             f"{run_name}_summary.json",
         )
 
-        with open(summary_path, "w") as f:
+        with open(
+            summary_path,
+            "w",
+        ) as f:
+
             json.dump(
                 summary,
                 f,
@@ -599,21 +755,11 @@ def train(cfg: dict, config_path: str = ""):
             )
 
         logger.info(
-            f"Summary written to {summary_path}"
-        )
-
-        logger.info(
-            f"Per-epoch metrics CSV: {csv_path}"
-        )
-
-        logger.info(
-            f"Full log: {log_path}"
+            f"Summary written to "
+            f"{summary_path}"
         )
 
     except Exception as e:
-        # ========================================================
-        # Crash report
-        # ========================================================
 
         logger.error(
             f"Training crashed at epoch "
@@ -624,37 +770,15 @@ def train(cfg: dict, config_path: str = ""):
             traceback.format_exc()
         )
 
-        crash_summary = {
-            "run_name": run_name,
-            "status": "crashed",
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-            "epochs_completed": len(history),
-            "best_loss": best_loss,
-            "history": history,
-        }
-
-        crash_path = os.path.join(
-            log_dir,
-            f"{run_name}_CRASHED.json",
-        )
-
-        with open(crash_path, "w") as f:
-            json.dump(
-                crash_summary,
-                f,
-                indent=2,
-                default=str,
-            )
-
-        logger.error(
-            f"Crash report written to {crash_path}"
-        )
-
         raise
 
 
+# ================================================================
+# CLI
+# ================================================================
+
 def main():
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -665,7 +789,10 @@ def main():
 
     args = parser.parse_args()
 
-    with open(args.config) as f:
+    with open(
+        args.config
+    ) as f:
+
         cfg = yaml.safe_load(f)
 
     train(

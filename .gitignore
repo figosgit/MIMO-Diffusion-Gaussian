@@ -3,3 +3,30 @@ CLAUDE.md
 /.pytest_cache
 /__pycache__
 /.venv
+/playground
+# Virtual environment
+/.venv
+
+# Playground
+/playground
+
+# Model checkpoints
+/score_networks/checkpoints/
+
+# Comparison outputs
+/score_networks/comparison/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Training / experiment outputs
+*.pt
+*.pth
+*.ckpt
+
+# Generated plots
+*.png
+
+# Logs
+*.log
